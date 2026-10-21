@@ -1,0 +1,6 @@
+{
+  "name": "Alarma Perimetral IoT",
+  "description": "Sistema de monitoreo y control de alarma perimetral de bodega con sensores PIR, magnético de puerta, sirena, estrobo, conexión TCP/IP, Bluetooth RFCOMM y soporte ESP32.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
