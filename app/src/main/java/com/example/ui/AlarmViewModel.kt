@@ -3,7 +3,9 @@ package com.example.ui
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.communication.ConnectionDiagnosticResult
 import com.example.communication.DeviceTarget
+import com.example.communication.DiscoveredDevice
 import com.example.data.local.AlarmDatabase
 import com.example.data.local.AlarmEventEntity
 import com.example.data.local.SecurityPreferences
@@ -79,6 +81,23 @@ class AlarmViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _isTcpServerMode = MutableStateFlow(false)
     val isTcpServerMode: StateFlow<Boolean> = _isTcpServerMode.asStateFlow()
+
+    // Conexión Guiada y Automática (Wi-Fi y Bluetooth)
+    private val _selectedTransportPreference = MutableStateFlow(TransportType.TCP)
+    val selectedTransportPreference: StateFlow<TransportType> = _selectedTransportPreference.asStateFlow()
+
+    private val _isHosting = MutableStateFlow(false)
+    val isHosting: StateFlow<Boolean> = _isHosting.asStateFlow()
+
+    val discoveredNsdDevices: StateFlow<List<DiscoveredDevice>> = alarmEngine.nsdDiscoveryManager.discoveredDevices
+    val isSearchingNsd: StateFlow<Boolean> = alarmEngine.nsdDiscoveryManager.isSearching
+    val isNsdRegistered: StateFlow<Boolean> = alarmEngine.nsdDiscoveryManager.isRegistered
+
+    private val _diagnosticResult = MutableStateFlow<ConnectionDiagnosticResult?>(null)
+    val diagnosticResult: StateFlow<ConnectionDiagnosticResult?> = _diagnosticResult.asStateFlow()
+
+    private val _showDiagnosticModal = MutableStateFlow(false)
+    val showDiagnosticModal: StateFlow<Boolean> = _showDiagnosticModal.asStateFlow()
 
     // Feedback visual y alertas
     private val _userFeedback = MutableSharedFlow<String>(extraBufferCapacity = 16)
@@ -263,16 +282,150 @@ class AlarmViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             val res = alarmEngine.connect(target)
             if (res.isSuccess) {
-                _userFeedback.emit("Modo Simulación Virtual conectado")
+                _userFeedback.emit("ESP32 Simulado conectado correctamente")
             }
         }
     }
 
+    fun toggleEsp32Simulation() {
+        val currentTransport = alarmEngine.activeTransportType.value
+        val isConnected = alarmEngine.connectionState.value == ConnectionState.CONNECTED
+        if (currentTransport == TransportType.SIMULATED && isConnected) {
+            disconnect()
+        } else {
+            connectSimulated()
+        }
+    }
+
     fun disconnect() {
+        stopHosting()
+        stopSearching()
         viewModelScope.launch {
             alarmEngine.disconnect()
             _userFeedback.emit("Desconectado")
         }
+    }
+
+    // Métodos del Asistente Rápido y Guiado de Conexión
+    fun setTransportPreference(type: TransportType) {
+        _selectedTransportPreference.value = type
+    }
+
+    fun startHosting(transportType: TransportType = _selectedTransportPreference.value) {
+        _isHosting.value = true
+        // Generar código de emparejamiento de seguridad para validación mutua
+        generatePairingCode()
+
+        viewModelScope.launch {
+            if (transportType == TransportType.TCP) {
+                val port = _tcpPort.value.toIntOrNull() ?: ProtocolConstants.DEFAULT_TCP_PORT
+                alarmEngine.nsdDiscoveryManager.startRegistration(
+                    deviceName = _myDeviceName.value,
+                    port = port,
+                    role = _myRole.value
+                )
+                val target = DeviceTarget.TcpServer(listenPort = port, deviceName = _myDeviceName.value)
+                alarmEngine.connect(target)
+            } else if (transportType == TransportType.BLUETOOTH_RFCOMM) {
+                val target = DeviceTarget.BluetoothRfcommServer(deviceName = _myDeviceName.value)
+                alarmEngine.connect(target)
+            }
+        }
+    }
+
+    fun stopHosting() {
+        _isHosting.value = false
+        alarmEngine.nsdDiscoveryManager.stopRegistration()
+        viewModelScope.launch {
+            alarmEngine.disconnect()
+            _userFeedback.emit("Servicio anfitrión detenido")
+        }
+    }
+
+    fun startSearching(transportType: TransportType = _selectedTransportPreference.value) {
+        if (transportType == TransportType.TCP) {
+            alarmEngine.nsdDiscoveryManager.startDiscovery()
+        }
+        viewModelScope.launch {
+            _userFeedback.emit("Buscando dispositivos compatibles en la red...")
+        }
+    }
+
+    fun stopSearching() {
+        alarmEngine.nsdDiscoveryManager.stopDiscovery()
+    }
+
+    fun connectToDiscoveredDevice(device: DiscoveredDevice) {
+        stopSearching()
+        val target = DeviceTarget.TcpClient(
+            ipAddress = device.hostAddress,
+            port = device.port,
+            deviceId = device.id,
+            deviceName = device.name
+        )
+        viewModelScope.launch {
+            _userFeedback.emit("Conectando con ${device.name} (${device.hostAddress})...")
+            val res = alarmEngine.connect(target)
+            if (res.isFailure) {
+                _userFeedback.emit("Error de conexión: ${res.exceptionOrNull()?.message}")
+            }
+        }
+    }
+
+    fun connectManualValidated(ip: String, portStr: String, name: String = "Dispositivo Manual") {
+        val trimmedIp = ip.trim()
+        val port = portStr.trim().toIntOrNull()
+
+        if (trimmedIp.isEmpty()) {
+            viewModelScope.launch { _userFeedback.emit("Por favor ingresa una dirección IP o nombre de host") }
+            return
+        }
+
+        // Validador de formato IPv4
+        val ipRegex = Regex("""^(\d{1,3}\.){3}\d{1,3}$""")
+        if (ipRegex.matches(trimmedIp)) {
+            val parts = trimmedIp.split(".")
+            val valid = parts.all { it.toIntOrNull() in 0..255 }
+            if (!valid) {
+                viewModelScope.launch { _userFeedback.emit("IP inválida. Cada segmento debe estar entre 0 y 255 (ej: 192.168.1.50)") }
+                return
+            }
+        }
+
+        if (port == null || port !in 1..65535) {
+            viewModelScope.launch { _userFeedback.emit("Puerto inválido. Debe ser un número entre 1 y 65535 (ej: 8888)") }
+            return
+        }
+
+        _tcpIp.value = trimmedIp
+        _tcpPort.value = port.toString()
+
+        val target = DeviceTarget.TcpClient(
+            ipAddress = trimmedIp,
+            port = port,
+            deviceName = if (name.isNotBlank()) name.trim() else "Dispositivo Manual"
+        )
+        viewModelScope.launch {
+            _userFeedback.emit("Iniciando conexión con $trimmedIp:$port...")
+            val res = alarmEngine.connect(target)
+            if (res.isFailure) {
+                _userFeedback.emit("Fallo al conectar: ${res.exceptionOrNull()?.message}")
+            }
+        }
+    }
+
+    fun runDiagnostic() {
+        val result = alarmEngine.connectionDiagnosticHelper.runFullDiagnostic()
+        _diagnosticResult.value = result
+        _showDiagnosticModal.value = true
+    }
+
+    fun dismissDiagnostic() {
+        _showDiagnosticModal.value = false
+    }
+
+    fun getLocalIpAddress(): String? {
+        return alarmEngine.nsdDiscoveryManager.getLocalIpAddress()
     }
 
     // Acciones de Alarma
@@ -284,6 +437,7 @@ class AlarmViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun disarmAlarm() {
+        alarmEngine.notificationManager.stopAlarmAudio()
         viewModelScope.launch {
             val sent = alarmEngine.sendDisarmCommand()
             if (!sent) _userFeedback.emit("No se pudo transmitir comando de desarmado")
@@ -291,6 +445,7 @@ class AlarmViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun silenceSiren() {
+        alarmEngine.notificationManager.stopAlarmAudio()
         viewModelScope.launch {
             val sent = alarmEngine.sendSilenceSirenCommand()
             if (!sent) _userFeedback.emit("No se pudo transmitir comando de silenciamiento")
@@ -339,6 +494,16 @@ class AlarmViewModel(application: Application) : AndroidViewModel(application) {
     fun simDisconnect() {
         viewModelScope.launch {
             alarmEngine.simulatedTransport.simulateConnectionLoss()
+        }
+    }
+
+    fun simTriggerSecurityAlert() {
+        viewModelScope.launch {
+            alarmEngine.triggerSecurityAlert(
+                title = "¡ALERTA DE SEGURIDAD: INTRUSIÓN SIMULADA!",
+                details = "Intrusión detectada en bodega: Sensor PIR y switch magnético activados simultáneamente."
+            )
+            _userFeedback.emit("Alerta enviada con notificación, sonido y vibración")
         }
     }
 }

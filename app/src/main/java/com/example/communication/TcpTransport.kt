@@ -22,6 +22,7 @@ import java.io.OutputStreamWriter
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.net.SocketException
 import java.nio.charset.StandardCharsets
 
 class TcpTransport(
@@ -43,6 +44,7 @@ class TcpTransport(
     private var serverSocket: ServerSocket? = null
     private var writer: BufferedWriter? = null
     private var readerJob: Job? = null
+    private var serverAcceptJob: Job? = null
     private var currentTarget: DeviceTarget? = null
     private var intentionalDisconnect = false
 
@@ -51,21 +53,33 @@ class TcpTransport(
         return s != null && s.isConnected && !s.isClosed && _connectionState.value == ConnectionState.CONNECTED
     }
 
+    fun getLocalServerPort(): Int? {
+        return serverSocket?.localPort
+    }
+
     override suspend fun connect(target: DeviceTarget): Result<Unit> = withContext(Dispatchers.IO) {
         disconnect()
         currentTarget = target
         intentionalDisconnect = false
         _lastError.value = null
-        _connectionState.value = ConnectionState.CONNECTING
+
+        if (target !is DeviceTarget.TcpClient && target !is DeviceTarget.TcpServer) {
+            val err = "TcpTransport sólo admite destinos TcpClient o TcpServer (recibido: ${target::class.simpleName})"
+            _lastError.value = err
+            _connectionState.value = ConnectionState.ERROR
+            return@withContext Result.failure(IllegalArgumentException(err))
+        }
 
         try {
             when (target) {
                 is DeviceTarget.TcpClient -> {
+                    _connectionState.value = ConnectionState.CONNECTING
                     val socket = Socket()
                     activeSocket = socket
                     socket.tcpNoDelay = true
-                    socket.soTimeout = 0 // Bloqueo controlado en corrutina
-                    socket.connect(InetSocketAddress(target.ipAddress, target.port), 6000)
+                    socket.soTimeout = 0 // Bloqueo controlado en corrutinas
+                    // Timeout de conexión 5000ms
+                    socket.connect(InetSocketAddress(target.ipAddress, target.port), 5000)
 
                     writer = BufferedWriter(OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8))
                     _connectionState.value = ConnectionState.CONNECTED
@@ -73,21 +87,28 @@ class TcpTransport(
                     Result.success(Unit)
                 }
                 is DeviceTarget.TcpServer -> {
-                    val server = ServerSocket(target.listenPort)
+                    _connectionState.value = ConnectionState.PREPARING_HOST
+                    val server = ServerSocket()
+                    server.reuseAddress = true
+                    server.bind(InetSocketAddress(target.listenPort))
                     serverSocket = server
-                    _connectionState.value = ConnectionState.CONNECTING
+                    _connectionState.value = ConnectionState.WAITING_FOR_DEVICE
 
-                    readerJob = scope.launch(Dispatchers.IO) {
+                    serverAcceptJob = scope.launch(Dispatchers.IO) {
                         try {
-                            // Esperar conexión entrante
+                            // Esperar conexión de cliente (límite: 1 conexión activa a la vez)
                             val client = server.accept()
+                            if (!isActive || intentionalDisconnect) {
+                                client.close()
+                                return@launch
+                            }
                             activeSocket = client
                             client.tcpNoDelay = true
                             writer = BufferedWriter(OutputStreamWriter(client.getOutputStream(), StandardCharsets.UTF_8))
                             _connectionState.value = ConnectionState.CONNECTED
                             readLoop(client)
                         } catch (e: Exception) {
-                            if (!intentionalDisconnect) {
+                            if (!intentionalDisconnect && e !is SocketException) {
                                 _lastError.value = "Error en servidor TCP: ${e.message}"
                                 _connectionState.value = ConnectionState.ERROR
                             }
@@ -97,14 +118,19 @@ class TcpTransport(
                 }
                 else -> {
                     _connectionState.value = ConnectionState.ERROR
-                    Result.failure(IllegalArgumentException("Target no es TCP"))
+                    Result.failure(IllegalArgumentException("Destino no es TCP"))
                 }
             }
         } catch (e: Exception) {
             _connectionState.value = ConnectionState.ERROR
-            _lastError.value = "Fallo de conexión TCP: ${e.message}"
+            val msg = when {
+                e is java.net.ConnectException -> "No se pudo conectar a $target: Conexión rechazada o equipo no disponible"
+                e is java.net.SocketTimeoutException -> "Tiempo de espera agotado al conectar con $target"
+                else -> "Fallo de conexión TCP: ${e.message}"
+            }
+            _lastError.value = msg
             cleanUpSockets()
-            Result.failure(e)
+            Result.failure<Unit>(Exception(msg, e))
         }
     }
 
@@ -119,16 +145,23 @@ class TcpTransport(
         try {
             val reader = BufferedReader(InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))
             while (isActive && !socket.isClosed) {
-                val line = reader.readLine() ?: break
+                val line = reader.readLine()
+                if (line == null) {
+                    // EOF: el socket remoto se cerró limpiamente
+                    break
+                }
                 if (line.length <= ProtocolConstants.MAX_MESSAGE_SIZE) {
                     _incomingMessages.emit(line)
                 } else {
-                    _lastError.value = "Mensaje excedió el límite de ${ProtocolConstants.MAX_MESSAGE_SIZE} bytes descartado"
+                    _lastError.value = "Mensaje excedió el límite de seguridad de ${ProtocolConstants.MAX_MESSAGE_SIZE} bytes"
                 }
             }
         } catch (e: Exception) {
             if (!intentionalDisconnect) {
-                _lastError.value = "Pérdida de enlace TCP: ${e.message}"
+                val isNormalClose = e is SocketException || e.message?.contains("closed", ignoreCase = true) == true
+                if (!isNormalClose) {
+                    _lastError.value = "Enlace TCP cerrado: ${e.message}"
+                }
             }
         } finally {
             if (!intentionalDisconnect) {
@@ -163,6 +196,8 @@ class TcpTransport(
         intentionalDisconnect = true
         readerJob?.cancel()
         readerJob = null
+        serverAcceptJob?.cancel()
+        serverAcceptJob = null
         cleanUpSockets()
         _connectionState.value = ConnectionState.DISCONNECTED
     }

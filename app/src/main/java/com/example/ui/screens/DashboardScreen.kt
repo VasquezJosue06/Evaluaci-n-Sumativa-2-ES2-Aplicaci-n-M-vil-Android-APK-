@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -19,6 +20,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -406,7 +408,12 @@ fun ConnectionStatusBar(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
+            Row(
+                modifier = Modifier
+                    .weight(1f)
+                    .padding(end = 8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
                 val icon = when (connectionState) {
                     ConnectionState.CONNECTED -> Icons.Default.CheckCircle
                     ConnectionState.CONNECTING, ConnectionState.RECONNECTING -> Icons.Default.Wifi
@@ -429,35 +436,52 @@ fun ConnectionStatusBar(
                     Text(
                         text = "${transportType.label}: ${connectionState.label}",
                         style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.SemiBold),
-                        color = MaterialTheme.colorScheme.onSurface
+                        color = MaterialTheme.colorScheme.onSurface,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
                     )
                     Text(
                         text = if (lastComm != null) "Última telemetría: $lastComm" else "Sin datos recibidos aún",
                         style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
                     )
                 }
             }
 
-            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
                 FilledTonalButton(
                     onClick = onOpenWizard,
                     shape = RoundedCornerShape(8.dp),
-                    modifier = Modifier.testTag("open_wizard_btn")
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                    modifier = Modifier
+                        .height(36.dp)
+                        .testTag("open_wizard_btn")
                 ) {
                     Icon(Icons.Default.AutoFixHigh, contentDescription = null, modifier = Modifier.size(16.dp))
                     Spacer(modifier = Modifier.width(4.dp))
-                    Text("Guía", fontSize = 12.sp)
+                    Text("Guía", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
                 }
 
                 FilledTonalButton(
                     onClick = onOpenSimulator,
                     shape = RoundedCornerShape(8.dp),
-                    modifier = Modifier.testTag("open_simulator_btn")
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                    colors = ButtonDefaults.filledTonalButtonColors(
+                        containerColor = SafetyOrange.copy(alpha = 0.15f),
+                        contentColor = SafetyOrange
+                    ),
+                    modifier = Modifier
+                        .height(36.dp)
+                        .testTag("open_simulator_btn")
                 ) {
                     Icon(Icons.Default.Science, contentDescription = null, modifier = Modifier.size(16.dp))
                     Spacer(modifier = Modifier.width(4.dp))
-                    Text("Sim", fontSize = 12.sp)
+                    Text("Sim", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
                 }
             }
         }

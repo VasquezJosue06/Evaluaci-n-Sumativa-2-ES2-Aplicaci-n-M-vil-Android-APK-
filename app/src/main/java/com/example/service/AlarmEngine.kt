@@ -9,9 +9,12 @@ import android.os.Vibrator
 import android.os.VibratorManager
 import com.example.communication.BluetoothRfcommTransport
 import com.example.communication.CommunicationTransport
+import com.example.communication.ConnectionDiagnosticHelper
 import com.example.communication.DeviceTarget
+import com.example.communication.NsdDiscoveryManager
 import com.example.communication.SimulatedTransport
 import com.example.communication.TcpTransport
+import com.example.data.model.ProtocolConstants
 import com.example.data.local.AlarmDatabase
 import com.example.data.local.AlarmEventEntity
 import com.example.data.local.DeviceSecurityRegistry
@@ -54,6 +57,7 @@ class AlarmEngine(
     val securityRegistry = DeviceSecurityRegistry(context, keyStoreHelper)
     val capabilityDetector = CapabilityDetector(context)
     val cameraDetector = CameraMotionDetector(context)
+    val notificationManager = SecurityNotificationManager(context)
 
     // Estados del sistema de alarma
     private val _alarmState = MutableStateFlow(AlarmState.DESARMADA)
@@ -101,14 +105,19 @@ class AlarmEngine(
     private val _pendingCommandId = MutableStateFlow<String?>(null)
     val pendingCommandId: StateFlow<String?> = _pendingCommandId.asStateFlow()
 
-    // Transportes
+    // Transportes y Descubrimiento
     val tcpTransport = TcpTransport(scope)
     val bluetoothTransport = BluetoothRfcommTransport(context, scope)
     val simulatedTransport = SimulatedTransport(scope)
+    val nsdDiscoveryManager = NsdDiscoveryManager(context, scope)
+    val connectionDiagnosticHelper = ConnectionDiagnosticHelper(context, nsdDiscoveryManager, bluetoothTransport)
 
     private var activeTransport: CommunicationTransport = tcpTransport
     private var transportCollectorJob: Job? = null
     private var scheduleEvaluatorJob: Job? = null
+    private var reconnectJob: Job? = null
+    private var activeTarget: DeviceTarget? = null
+    private var currentPingNonce: String? = null
     private var soundPool: SoundPool? = null
     private var sirenSoundId: Int = 0
 
@@ -157,7 +166,8 @@ class AlarmEngine(
             _alarmState.value = AlarmState.ALERTA
             _sirenActive.value = true
             _strobeActive.value = true
-            triggerAlertHaptics()
+            val alertDetails = "¡INTRUSIÓN! Cámara detectó movimiento visual significativo (confianza: ${(confidence * 100).toInt()}%)"
+            triggerSecurityAlert("¡ALERTA DE SEGURIDAD: CÁMARA!", alertDetails)
         }
 
         // Registrar evento
@@ -213,28 +223,43 @@ class AlarmEngine(
         transportCollectorJob = scope.launch(Dispatchers.IO) {
             launch {
                 transport.connectionState.collect { cState ->
-                    _connectionState.value = cState
-                    if (cState == ConnectionState.DISCONNECTED || cState == ConnectionState.ERROR) {
-                        if (_alarmState.value == AlarmState.ARMADA || _alarmState.value == AlarmState.ALERTA) {
-                            _lastArmedStateBeforeDisconnect.value = _alarmState.value
-                        }
-                        _alarmState.value = AlarmState.SIN_CONEXION
+                    when (cState) {
+                        ConnectionState.DISCONNECTED, ConnectionState.ERROR -> {
+                            _connectionState.value = cState
+                            if (_alarmState.value == AlarmState.ARMADA || _alarmState.value == AlarmState.ALERTA) {
+                                _lastArmedStateBeforeDisconnect.value = _alarmState.value
+                            }
+                            _alarmState.value = AlarmState.SIN_CONEXION
 
-                        recordEvent(
-                            eventType = "CONNECTION_LOST",
-                            details = "Enlace interrumpido (${transport.transportType.label}). El detector continuará encolando eventos localmente.",
-                            sensor = null
-                        )
-                    } else if (cState == ConnectionState.CONNECTED) {
-                        recordEvent(
-                            eventType = "CONNECTION_ESTABLISHED",
-                            details = "Enlace activo con ${transport.transportType.label}. Iniciando sincronización de eventos pendientes.",
-                            sensor = null
-                        )
-                        // Sincronizar cola offline de eventos pendientes
-                        synchronizePendingEvents()
-                        // Solicitar estado inmediato
-                        requestStatus()
+                            recordEvent(
+                                eventType = "CONNECTION_LOST",
+                                details = "Enlace interrumpido (${transport.transportType.label}). El detector conservará eventos en cola local.",
+                                sensor = null
+                            )
+                            triggerAutoReconnect()
+                        }
+                        ConnectionState.PREPARING_HOST, ConnectionState.WAITING_FOR_DEVICE, ConnectionState.CONNECTING, ConnectionState.SEARCHING, ConnectionState.REQUESTING_AUTH -> {
+                            _connectionState.value = cState
+                        }
+                        ConnectionState.CONNECTED -> {
+                            if (transport.transportType == TransportType.SIMULATED) {
+                                _connectionState.value = ConnectionState.CONNECTED
+                                recordEvent(
+                                    eventType = "CONNECTION_ESTABLISHED",
+                                    details = "Simulador de demostración activo.",
+                                    sensor = null
+                                )
+                                synchronizePendingEvents()
+                                requestStatus()
+                            } else {
+                                // Iniciar protocolo de verificación de compatibilidad, handshake y prueba de eco
+                                _connectionState.value = ConnectionState.VERIFYING_COMMUNICATION
+                                initiateHandshakeAndVerification()
+                            }
+                        }
+                        ConnectionState.RECONNECTING, ConnectionState.VERIFYING_COMMUNICATION -> {
+                            _connectionState.value = cState
+                        }
                     }
                 }
             }
@@ -243,6 +268,41 @@ class AlarmEngine(
                 transport.incomingMessages.collect { rawMsg ->
                     processIncomingMessage(rawMsg)
                 }
+            }
+        }
+    }
+
+    private suspend fun initiateHandshakeAndVerification() {
+        val req = ProtocolMessage.HandshakeRequest(
+            deviceId = securityRegistry.getMyDeviceId(),
+            deviceName = securityRegistry.getMyDeviceName(),
+            deviceKind = if (securityRegistry.getMyDeviceRole() == DeviceRole.RECEPTOR_MONITOR) "TABLET" else "PHONE",
+            role = securityRegistry.getMyDeviceRole().name,
+            protocolVersion = ProtocolConstants.PROTOCOL_VERSION
+        )
+        activeTransport.send(req.toJsonString())
+    }
+
+    private fun triggerAutoReconnect() {
+        val target = activeTarget
+        if (reconnectJob?.isActive == true || target == null || activeTransport.transportType == TransportType.SIMULATED) return
+        reconnectJob = scope.launch(Dispatchers.IO) {
+            var delayMs = 2000L
+            for (attempt in 1..5) {
+                if (!isActive || activeTransport.isConnected()) break
+                _connectionState.value = ConnectionState.RECONNECTING
+                _lastCommandFeedback.emit("Reconexión automática: intento $attempt/5 en ${delayMs / 1000}s...")
+                delay(delayMs)
+                if (!isActive || activeTransport.isConnected()) break
+                val res = activeTransport.connect(target)
+                if (res.isSuccess) {
+                    _lastCommandFeedback.emit("Enlace reestablecido con éxito")
+                    break
+                }
+                delayMs = (delayMs * 1.5).toLong().coerceAtMost(10000L)
+            }
+            if (!activeTransport.isConnected()) {
+                _connectionState.value = ConnectionState.DISCONNECTED
             }
         }
     }
@@ -276,7 +336,8 @@ class AlarmEngine(
                 _alarmState.value = parsedState
 
                 if (parsedState == AlarmState.ALERTA) {
-                    triggerAlertHaptics()
+                    val alertDetails = "Controlador [${parsed.deviceId}] reportó disparo de alarma general y sirena activa."
+                    triggerSecurityAlert("¡ALERTA DE SEGURIDAD EN CONTROLADOR!", alertDetails)
                 }
             }
             is ProtocolMessage.SensorEvent -> {
@@ -289,7 +350,8 @@ class AlarmEngine(
                                 _alarmState.value = AlarmState.ALERTA
                                 _sirenActive.value = true
                                 _strobeActive.value = true
-                                triggerAlertHaptics()
+                                val detailsText = "¡INTRUSIÓN! Sensor PIR detectó movimiento en el área protegida de la bodega."
+                                triggerSecurityAlert("¡ALERTA DE SEGURIDAD: INTRUSIÓN PIR!", detailsText)
                             }
                             recordEvent(
                                 eventType = if (parsed.armed) "INTRUSION_PIR" else "SENSOR_PIR_ACTIVITY",
@@ -310,7 +372,8 @@ class AlarmEngine(
                             _alarmState.value = AlarmState.ALERTA
                             _sirenActive.value = true
                             _strobeActive.value = true
-                            triggerAlertHaptics()
+                            val detailsText = "¡INTRUSIÓN! Switch magnético detectó apertura no autorizada de la puerta de bodega."
+                            triggerSecurityAlert("¡ALERTA DE SEGURIDAD: PUERTA ABIERTA!", detailsText)
                         }
                         recordEvent(
                             eventType = if (isOpen && parsed.armed) "INTRUSION_DOOR" else "SENSOR_DOOR_ACTIVITY",
@@ -327,7 +390,8 @@ class AlarmEngine(
                             _alarmState.value = AlarmState.ALERTA
                             _sirenActive.value = true
                             _strobeActive.value = true
-                            triggerAlertHaptics()
+                            val detailsText = "Alerta remota recibida de cámara en dispositivo [${parsed.deviceId}] (confianza: ${(parsed.confidence * 100).toInt()}%)"
+                            triggerSecurityAlert("¡ALERTA DE SEGURIDAD: CÁMARA REMOTA!", detailsText)
                         }
                         recordEvent(
                             eventType = if (parsed.armed) "INTRUSION_CAMERA" else "SENSOR_CAMERA_ACTIVITY",
@@ -368,7 +432,60 @@ class AlarmEngine(
                 parsed.acknowledgedEventIds.forEach { eid ->
                     database.alarmEventDao().markEventAsSynced(eid)
                 }
-                _lastCommandFeedback.emit("Sincronización confirmada: ${parsed.acknowledgedEventIds.size} eventos actualizados.")
+            }
+            is ProtocolMessage.HandshakeRequest -> {
+                val isAuth = securityRegistry.isDeviceAuthorized(parsed.deviceId)
+                val resp = ProtocolMessage.HandshakeResponse(
+                    deviceId = securityRegistry.getMyDeviceId(),
+                    deviceName = securityRegistry.getMyDeviceName(),
+                    compatible = (parsed.protocolVersion == ProtocolConstants.PROTOCOL_VERSION),
+                    protocolVersion = ProtocolConstants.PROTOCOL_VERSION,
+                    assignedRole = securityRegistry.getMyDeviceRole().name,
+                    requiresPairing = !isAuth,
+                    message = if (parsed.protocolVersion == ProtocolConstants.PROTOCOL_VERSION) "Protocolo compatible" else "Versión incompatible"
+                )
+                activeTransport.send(resp.toJsonString())
+
+                if (!isAuth) {
+                    _connectionState.value = ConnectionState.REQUESTING_AUTH
+                    _lastCommandFeedback.emit("Dispositivo ${parsed.deviceName} requiere autorización")
+                } else {
+                    // Enviar PING de prueba de comunicación
+                    val nonce = UUID.randomUUID().toString()
+                    currentPingNonce = nonce
+                    activeTransport.send(ProtocolMessage.Ping(nonce = nonce).toJsonString())
+                }
+            }
+            is ProtocolMessage.HandshakeResponse -> {
+                if (!parsed.compatible) {
+                    _connectionState.value = ConnectionState.ERROR
+                    _lastCommandFeedback.emit("Incompatible: ${parsed.message}")
+                } else if (parsed.requiresPairing) {
+                    _connectionState.value = ConnectionState.REQUESTING_AUTH
+                    _lastCommandFeedback.emit("El anfitrión requiere emparejamiento previo")
+                } else {
+                    // Enviar PING para prueba roundtrip de eco antes de declarar CONECTADO
+                    val nonce = UUID.randomUUID().toString()
+                    currentPingNonce = nonce
+                    activeTransport.send(ProtocolMessage.Ping(nonce = nonce).toJsonString())
+                }
+            }
+            is ProtocolMessage.Ping -> {
+                // Responder inmediatamente con Pong
+                activeTransport.send(ProtocolMessage.Pong(nonce = parsed.nonce).toJsonString())
+            }
+            is ProtocolMessage.Pong -> {
+                // Eco bidireccional verificado con éxito
+                currentPingNonce = null
+                _connectionState.value = ConnectionState.CONNECTED
+                recordEvent(
+                    eventType = "CONNECTION_ESTABLISHED",
+                    details = "Enlace activo y verificado bidireccionalmente con ${activeTransport.transportType.label}.",
+                    sensor = null
+                )
+                _lastCommandFeedback.emit("Conectado correctamente")
+                synchronizePendingEvents()
+                requestStatus()
             }
             else -> {}
         }
@@ -399,18 +516,24 @@ class AlarmEngine(
                 _alarmState.value = AlarmState.DESARMADA
                 _sirenActive.value = false
                 _strobeActive.value = false
+                notificationManager.stopAlarmAudio()
                 val res = ProtocolMessage.CommandResult(cmd.commandId, true, "Sistema DESARMADO por comando remoto", cmd.action)
                 activeTransport.send(res.toJsonString())
             }
             "SILENCE_SIREN" -> {
                 _sirenActive.value = false
+                notificationManager.stopAlarmAudio()
                 val res = ProtocolMessage.CommandResult(cmd.commandId, true, "Sirena silenciada. Protección activa.", cmd.action)
                 activeTransport.send(res.toJsonString())
             }
             "TEST_ALARM" -> {
                 _sirenActive.value = true
                 _strobeActive.value = true
-                triggerAlertHaptics()
+                triggerSecurityAlert(
+                    "PRUEBA DE ALARMA PERIMETRAL",
+                    "Prueba de sirena física, sonido y vibración activada desde dispositivo remoto.",
+                    isTest = true
+                )
                 val res = ProtocolMessage.CommandResult(cmd.commandId, true, "Prueba de alarma activada", cmd.action)
                 activeTransport.send(res.toJsonString())
                 scope.launch {
@@ -537,20 +660,39 @@ class AlarmEngine(
         }
     }
 
-    private fun triggerAlertHaptics() {
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                vibrator?.vibrate(VibrationEffect.createWaveform(longArrayOf(0, 300, 150, 300, 150, 600), -1))
-            } else {
-                @Suppress("DEPRECATION")
-                vibrator?.vibrate(500)
-            }
-        } catch (_: Exception) {}
+    fun triggerSecurityAlert(title: String, details: String, isTest: Boolean = false) {
+        notificationManager.dispatchSecurityAlert(title, details, isTest)
     }
 
-    suspend fun connect(target: DeviceTarget): Result<Unit> = activeTransport.connect(target)
+    private fun triggerAlertHaptics() {
+        triggerSecurityAlert("¡ALERTA DE SEGURIDAD!", "Disparo de alarma perimetral en curso.")
+    }
 
-    suspend fun disconnect() = activeTransport.disconnect()
+    suspend fun connect(target: DeviceTarget): Result<Unit> {
+        reconnectJob?.cancel()
+        reconnectJob = null
+        activeTarget = target
+
+        // Asegurar que el transporte activo coincida estrictamente con el tipo de destino
+        val neededType = target.transportType
+        if (_activeTransportType.value != neededType) {
+            _activeTransportType.value = neededType
+            val newTransport = when (neededType) {
+                TransportType.TCP -> tcpTransport
+                TransportType.BLUETOOTH_RFCOMM -> bluetoothTransport
+                TransportType.SIMULATED -> simulatedTransport
+            }
+            bindTransport(newTransport)
+        }
+        return activeTransport.connect(target)
+    }
+
+    suspend fun disconnect() {
+        reconnectJob?.cancel()
+        reconnectJob = null
+        activeTarget = null
+        activeTransport.disconnect()
+    }
 
     suspend fun sendArmCommand(): Boolean {
         if (!securityRegistry.getMyDeviceRole().canSendCommands) {
@@ -574,6 +716,7 @@ class AlarmEngine(
     }
 
     suspend fun sendDisarmCommand(): Boolean {
+        notificationManager.stopAlarmAudio()
         if (!securityRegistry.getMyDeviceRole().canSendCommands) {
             _lastCommandFeedback.emit("Acción denegada: Su rol es Monitor de Solo Lectura")
             return false
@@ -595,6 +738,7 @@ class AlarmEngine(
     }
 
     suspend fun sendSilenceSirenCommand(): Boolean {
+        notificationManager.stopAlarmAudio()
         if (!activeTransport.isConnected()) {
             _lastCommandFeedback.emit("Error: Dispositivo no conectado")
             return false
@@ -612,9 +756,15 @@ class AlarmEngine(
     }
 
     suspend fun sendTestAlarmCommand(): Boolean {
+        // Disparar alerta sonora, vibración y notificación local inmediata de prueba
+        triggerSecurityAlert(
+            "PRUEBA DE ALARMA PERIMETRAL",
+            "Prueba de sonido de sirena, vibración táctil y notificación del sistema ejecutada correctamente.",
+            isTest = true
+        )
         if (!activeTransport.isConnected()) {
-            _lastCommandFeedback.emit("Error: Dispositivo no conectado")
-            return false
+            _lastCommandFeedback.emit("Alerta de prueba ejecutada localmente (sin enlace remoto)")
+            return true
         }
         val cmdId = "cmd_test_${System.currentTimeMillis()}"
         _pendingCommandId.value = cmdId

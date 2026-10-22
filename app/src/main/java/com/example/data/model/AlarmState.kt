@@ -16,8 +16,13 @@ enum class AlarmState(val label: String) {
 
 enum class ConnectionState(val label: String) {
     DISCONNECTED("Desconectado"),
+    PREPARING_HOST("Preparando conexión..."),
+    WAITING_FOR_DEVICE("Esperando otro dispositivo..."),
+    SEARCHING("Buscando dispositivos..."),
     CONNECTING("Conectando..."),
-    CONNECTED("Conectado"),
+    REQUESTING_AUTH("Solicitando autorización..."),
+    VERIFYING_COMMUNICATION("Verificando comunicación..."),
+    CONNECTED("Conectado correctamente"),
     RECONNECTING("Reconectando..."),
     ERROR("Error de Comunicación")
 }

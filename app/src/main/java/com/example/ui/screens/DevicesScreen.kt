@@ -9,6 +9,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -17,6 +18,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -42,6 +44,7 @@ import androidx.compose.material.icons.filled.Sensors
 import androidx.compose.material.icons.filled.SwapHoriz
 import androidx.compose.material.icons.filled.Tablet
 import androidx.compose.material.icons.filled.Wifi
+import androidx.compose.material.icons.filled.WifiTethering
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -105,6 +108,15 @@ fun DevicesScreen(viewModel: AlarmViewModel) {
     var showPairingModal by remember { mutableStateOf(false) }
     var inputCodeToPair by remember { mutableStateOf("") }
     var selectedRoleToRequest by remember { mutableStateOf(DeviceRole.RECEPTOR_MONITOR) }
+    var showConnectScreen by remember { mutableStateOf(false) }
+
+    if (showConnectScreen) {
+        ConnectDevicesScreen(
+            viewModel = viewModel,
+            onNavigateBack = { showConnectScreen = false }
+        )
+        return
+    }
 
     val isConnected = connectionState == ConnectionState.CONNECTED
 
@@ -139,7 +151,7 @@ fun DevicesScreen(viewModel: AlarmViewModel) {
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Column {
+            Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
                 Text(
                     text = "Dispositivos y Red",
                     style = MaterialTheme.typography.headlineSmall.copy(fontWeight = FontWeight.Bold),
@@ -152,19 +164,95 @@ fun DevicesScreen(viewModel: AlarmViewModel) {
                 )
             }
 
-            Button(
+            OutlinedButton(
                 onClick = { showPairingModal = true },
                 shape = RoundedCornerShape(10.dp),
-                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
-                modifier = Modifier.testTag("pair_device_btn")
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                modifier = Modifier
+                    .height(38.dp)
+                    .testTag("pair_device_btn")
             ) {
                 Icon(Icons.Default.Key, contentDescription = null, modifier = Modifier.size(16.dp))
-                Spacer(modifier = Modifier.width(6.dp))
-                Text("Emparejar")
+                Spacer(modifier = Modifier.width(4.dp))
+                Text("Código", fontSize = 12.sp)
             }
         }
 
-        // TARJETA DE ESTE DISPOSITIVO (ROL LOCAL & CAMBIO RÁPIDO CELULAR/TABLET)
+        // HERO CARD: ASISTENTE DE CONEXIÓN ENTRE DISPOSITIVOS
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable { showConnectScreen = true }
+                .testTag("banner_connect_devices"),
+            shape = RoundedCornerShape(16.dp),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
+            elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.weight(1f).padding(end = 12.dp)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(46.dp)
+                            .background(MaterialTheme.colorScheme.primary, CircleShape),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            Icons.Default.WifiTethering,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onPrimary,
+                            modifier = Modifier.size(24.dp)
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(12.dp))
+                    Column {
+                        Text(
+                            text = "Asistente: Conectar dispositivos",
+                            style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
+                            color = MaterialTheme.colorScheme.onPrimaryContainer
+                        )
+                        Text(
+                            text = "Crear conexión o buscar celulares, tablets y ESP32",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.85f)
+                        )
+                    }
+                }
+
+                Button(
+                    onClick = { showConnectScreen = true },
+                    shape = RoundedCornerShape(12.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
+                    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
+                    modifier = Modifier
+                        .height(44.dp)
+                        .testTag("connect_devices_btn")
+                        .testTag("btn_launch_connect_screen")
+                ) {
+                    Icon(
+                        Icons.Default.WifiTethering,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        "Conectar",
+                        fontWeight = FontWeight.Bold,
+                        style = MaterialTheme.typography.labelLarge
+                    )
+                }
+            }
+        }
+
+        // TARJETA DE ESTE DISPOSITIVO (ROL LOCAL)
         Card(
             modifier = Modifier.fillMaxWidth(),
             shape = RoundedCornerShape(16.dp),
@@ -179,38 +267,24 @@ fun DevicesScreen(viewModel: AlarmViewModel) {
             ) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Box(
-                            modifier = Modifier
-                                .size(40.dp)
-                                .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.15f), CircleShape),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Icon(
-                                imageVector = if (myRole == DeviceRole.EMISOR_DETECTOR) Icons.Default.PhoneAndroid else Icons.Default.Tablet,
-                                contentDescription = null,
-                                tint = MaterialTheme.colorScheme.primary
-                            )
-                        }
-                        Spacer(modifier = Modifier.width(10.dp))
-                        Column {
-                            Text(text = "Este Equipo: $myDeviceName", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleMedium)
-                            Text(text = "Rol actual: ${myRole.label}", color = SecureGreen, fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.bodySmall)
-                        }
-                    }
-
-                    // Botón para intercambiar roles (Caso obligatorio Celular <-> Tablet)
-                    OutlinedButton(
-                        onClick = { viewModel.swapRoleBetweenPhoneAndTablet() },
-                        shape = RoundedCornerShape(8.dp),
-                        modifier = Modifier.testTag("swap_role_btn")
+                    Box(
+                        modifier = Modifier
+                            .size(40.dp)
+                            .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.15f), CircleShape),
+                        contentAlignment = Alignment.Center
                     ) {
-                        Icon(Icons.Default.SwapHoriz, contentDescription = null, modifier = Modifier.size(16.dp))
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text("Cambiar Rol", fontSize = 12.sp)
+                        Icon(
+                            imageVector = if (myRole == DeviceRole.EMISOR_DETECTOR) Icons.Default.PhoneAndroid else Icons.Default.Tablet,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(10.dp))
+                    Column {
+                        Text(text = "Este Equipo: $myDeviceName", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleMedium)
+                        Text(text = "Rol actual: ${myRole.label}", color = SecureGreen, fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.bodySmall)
                     }
                 }
 

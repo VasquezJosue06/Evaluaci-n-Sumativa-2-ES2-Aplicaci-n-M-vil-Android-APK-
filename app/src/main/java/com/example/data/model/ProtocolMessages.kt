@@ -7,10 +7,12 @@ import java.util.UUID
 
 object ProtocolConstants {
     const val PROTOCOL_VERSION = "2.0"
-    const val MAX_MESSAGE_SIZE = 8192
+    const val MAX_MESSAGE_SIZE = 65536 // 64KB max payload security frame
     const val DEFAULT_TCP_PORT = 8888
     const val DEFAULT_ESP32_IP = "192.168.4.1"
     const val BT_SPP_UUID = "00001101-0000-1000-8000-00805F9B34FB"
+    const val SERVICE_TYPE_NSD = "_perimetral._tcp."
+    const val DEFAULT_SERVICE_NAME = "AlarmaPerimetral"
 }
 
 sealed class ProtocolMessage {
@@ -203,6 +205,82 @@ sealed class ProtocolMessage {
         }
     }
 
+    data class HandshakeRequest(
+        val deviceId: String,
+        val deviceName: String,
+        val deviceKind: String = "PHONE",
+        val role: String = "EMISOR_RECEPTOR",
+        val protocolVersion: String = ProtocolConstants.PROTOCOL_VERSION,
+        val timestamp: String = Instant.now().toString()
+    ) : ProtocolMessage() {
+        override val type: String = "handshake_request"
+        override fun toJsonString(): String {
+            val json = JSONObject()
+            json.put("type", type)
+            json.put("version", protocolVersion)
+            json.put("deviceId", deviceId)
+            json.put("deviceName", deviceName)
+            json.put("deviceKind", deviceKind)
+            json.put("role", role)
+            json.put("timestamp", timestamp)
+            return json.toString()
+        }
+    }
+
+    data class HandshakeResponse(
+        val deviceId: String,
+        val deviceName: String,
+        val compatible: Boolean,
+        val protocolVersion: String = ProtocolConstants.PROTOCOL_VERSION,
+        val assignedRole: String = "EMISOR_RECEPTOR",
+        val requiresPairing: Boolean = false,
+        val message: String = "OK",
+        val timestamp: String = Instant.now().toString()
+    ) : ProtocolMessage() {
+        override val type: String = "handshake_response"
+        override fun toJsonString(): String {
+            val json = JSONObject()
+            json.put("type", type)
+            json.put("version", protocolVersion)
+            json.put("deviceId", deviceId)
+            json.put("deviceName", deviceName)
+            json.put("compatible", compatible)
+            json.put("assignedRole", assignedRole)
+            json.put("requiresPairing", requiresPairing)
+            json.put("message", message)
+            json.put("timestamp", timestamp)
+            return json.toString()
+        }
+    }
+
+    data class Ping(
+        val nonce: String = UUID.randomUUID().toString(),
+        val timestamp: String = Instant.now().toString()
+    ) : ProtocolMessage() {
+        override val type: String = "ping"
+        override fun toJsonString(): String {
+            val json = JSONObject()
+            json.put("type", type)
+            json.put("nonce", nonce)
+            json.put("timestamp", timestamp)
+            return json.toString()
+        }
+    }
+
+    data class Pong(
+        val nonce: String,
+        val timestamp: String = Instant.now().toString()
+    ) : ProtocolMessage() {
+        override val type: String = "pong"
+        override fun toJsonString(): String {
+            val json = JSONObject()
+            json.put("type", type)
+            json.put("nonce", nonce)
+            json.put("timestamp", timestamp)
+            return json.toString()
+        }
+    }
+
     data class Heartbeat(
         val deviceId: String,
         val sequence: Long,
@@ -313,6 +391,32 @@ object ProtocolParser {
                         timestamp = json.optString("timestamp", Instant.now().toString())
                     )
                 }
+                "handshake_request" -> ProtocolMessage.HandshakeRequest(
+                    deviceId = json.optString("deviceId", "unknown"),
+                    deviceName = json.optString("deviceName", "Dispositivo"),
+                    deviceKind = json.optString("deviceKind", "PHONE"),
+                    role = json.optString("role", "EMISOR_RECEPTOR"),
+                    protocolVersion = json.optString("version", ProtocolConstants.PROTOCOL_VERSION),
+                    timestamp = json.optString("timestamp", Instant.now().toString())
+                )
+                "handshake_response" -> ProtocolMessage.HandshakeResponse(
+                    deviceId = json.optString("deviceId", "unknown"),
+                    deviceName = json.optString("deviceName", "Dispositivo"),
+                    compatible = json.optBoolean("compatible", false),
+                    protocolVersion = json.optString("version", ProtocolConstants.PROTOCOL_VERSION),
+                    assignedRole = json.optString("assignedRole", "EMISOR_RECEPTOR"),
+                    requiresPairing = json.optBoolean("requiresPairing", false),
+                    message = json.optString("message", "OK"),
+                    timestamp = json.optString("timestamp", Instant.now().toString())
+                )
+                "ping" -> ProtocolMessage.Ping(
+                    nonce = json.optString("nonce", UUID.randomUUID().toString()),
+                    timestamp = json.optString("timestamp", Instant.now().toString())
+                )
+                "pong" -> ProtocolMessage.Pong(
+                    nonce = json.optString("nonce", ""),
+                    timestamp = json.optString("timestamp", Instant.now().toString())
+                )
                 "heartbeat" -> ProtocolMessage.Heartbeat(
                     deviceId = json.optString("deviceId", "unknown"),
                     sequence = json.optLong("sequence", 0L),

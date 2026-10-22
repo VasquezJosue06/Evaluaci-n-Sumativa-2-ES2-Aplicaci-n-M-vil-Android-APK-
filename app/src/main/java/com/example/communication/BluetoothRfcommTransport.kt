@@ -3,6 +3,7 @@ package com.example.communication
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothServerSocket
 import android.bluetooth.BluetoothSocket
 import android.content.Context
 import com.example.data.model.ConnectionState
@@ -22,6 +23,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.BufferedReader
 import java.io.BufferedWriter
+import java.io.IOException
 import java.io.InputStreamReader
 import java.io.OutputStreamWriter
 import java.nio.charset.StandardCharsets
@@ -44,12 +46,15 @@ class BluetoothRfcommTransport(
     override val lastError: StateFlow<String?> = _lastError.asStateFlow()
 
     private var activeSocket: BluetoothSocket? = null
+    private var serverSocket: BluetoothServerSocket? = null
     private var writer: BufferedWriter? = null
     private var readerJob: Job? = null
+    private var serverAcceptJob: Job? = null
     private var intentionalDisconnect = false
 
     private val bluetoothAdapter: BluetoothAdapter? by lazy {
         val manager = context.getSystemService(Context.BLUETOOTH_SERVICE) as? android.bluetooth.BluetoothManager
+        @Suppress("DEPRECATION")
         manager?.adapter ?: BluetoothAdapter.getDefaultAdapter()
     }
 
@@ -81,57 +86,103 @@ class BluetoothRfcommTransport(
         disconnect()
         intentionalDisconnect = false
         _lastError.value = null
-        _connectionState.value = ConnectionState.CONNECTING
 
-        if (target !is DeviceTarget.BluetoothRfcomm) {
+        if (target !is DeviceTarget.BluetoothRfcomm && target !is DeviceTarget.BluetoothRfcommServer) {
+            val err = "BluetoothRfcommTransport sólo admite destinos Bluetooth (recibido: ${target::class.simpleName})"
+            _lastError.value = err
             _connectionState.value = ConnectionState.ERROR
-            return@withContext Result.failure(IllegalArgumentException("Target no es Bluetooth"))
+            return@withContext Result.failure(IllegalArgumentException(err))
         }
 
         val adapter = bluetoothAdapter
         if (adapter == null) {
-            val err = "Bluetooth no soportado en este dispositivo"
+            val err = "Bluetooth no está soportado en este dispositivo"
             _lastError.value = err
             _connectionState.value = ConnectionState.ERROR
             return@withContext Result.failure(IllegalStateException(err))
         }
 
         if (!adapter.isEnabled) {
-            val err = "Bluetooth desactivado. Por favor actívelo en ajustes."
+            val err = "Bluetooth desactivado. Por favor actívelo en ajustes del sistema."
             _lastError.value = err
             _connectionState.value = ConnectionState.ERROR
             return@withContext Result.failure(IllegalStateException(err))
         }
 
+        val sppUuid = UUID.fromString(ProtocolConstants.BT_SPP_UUID)
+
         try {
-            val device = adapter.getRemoteDevice(target.deviceAddress)
-            val sppUuid = UUID.fromString(ProtocolConstants.BT_SPP_UUID)
-            // Cancelar discovery para mejorar throughput y estabilidad
-            try { adapter.cancelDiscovery() } catch (_: SecurityException) {}
+            when (target) {
+                is DeviceTarget.BluetoothRfcommServer -> {
+                    _connectionState.value = ConnectionState.PREPARING_HOST
+                    val server = adapter.listenUsingRfcommWithServiceRecord(target.serviceName, sppUuid)
+                    serverSocket = server
+                    _connectionState.value = ConnectionState.WAITING_FOR_DEVICE
 
-            val socket = device.createRfcommSocketToServiceRecord(sppUuid)
-            activeSocket = socket
-            socket.connect()
+                    serverAcceptJob = scope.launch(Dispatchers.IO) {
+                        try {
+                            val clientSocket = server.accept()
+                            if (!isActive || intentionalDisconnect) {
+                                clientSocket.close()
+                                return@launch
+                            }
+                            activeSocket = clientSocket
+                            writer = BufferedWriter(OutputStreamWriter(clientSocket.outputStream, StandardCharsets.UTF_8))
+                            _connectionState.value = ConnectionState.CONNECTED
+                            readLoop(clientSocket)
+                        } catch (e: Exception) {
+                            if (!intentionalDisconnect) {
+                                val isNormalClose = e.message?.contains("closed", ignoreCase = true) == true
+                                if (!isNormalClose) {
+                                    _lastError.value = "Error en servidor Bluetooth: ${e.message}"
+                                    _connectionState.value = ConnectionState.ERROR
+                                }
+                            }
+                        }
+                    }
+                    Result.success(Unit)
+                }
 
-            writer = BufferedWriter(OutputStreamWriter(socket.outputStream, StandardCharsets.UTF_8))
-            _connectionState.value = ConnectionState.CONNECTED
+                is DeviceTarget.BluetoothRfcomm -> {
+                    _connectionState.value = ConnectionState.CONNECTING
+                    val device = adapter.getRemoteDevice(target.deviceAddress)
+                    // Cancelar discovery para optimizar throughput y estabilidad del canal RFCOMM
+                    try { adapter.cancelDiscovery() } catch (_: SecurityException) {}
 
-            readerJob = scope.launch(Dispatchers.IO) {
-                readLoop(socket)
+                    val socket = device.createRfcommSocketToServiceRecord(sppUuid)
+                    activeSocket = socket
+                    socket.connect()
+
+                    writer = BufferedWriter(OutputStreamWriter(socket.outputStream, StandardCharsets.UTF_8))
+                    _connectionState.value = ConnectionState.CONNECTED
+
+                    readerJob = scope.launch(Dispatchers.IO) {
+                        readLoop(socket)
+                    }
+                    Result.success(Unit)
+                }
+                else -> Result.failure(IllegalArgumentException("Destino no soportado"))
             }
-            Result.success(Unit)
         } catch (e: SecurityException) {
-            val err = "Permiso de Bluetooth denegado (BLUETOOTH_CONNECT)"
+            val err = "Permiso de Bluetooth denegado (BLUETOOTH_CONNECT). Conceda permisos en Ajustes."
             _lastError.value = err
             _connectionState.value = ConnectionState.ERROR
             cleanUp()
             Result.failure(e)
         } catch (e: Exception) {
-            val err = "Fallo al conectar RFCOMM con ${target.deviceAddress}: ${e.message}"
-            _lastError.value = err
+            val rawMsg = e.message ?: ""
+            val userFriendlyMsg = when {
+                rawMsg.contains("read ret: -1", ignoreCase = true) || rawMsg.contains("socket might closed", ignoreCase = true) ->
+                    "El canal RFCOMM fue cerrado o expiró el tiempo de espera."
+                rawMsg.contains("connection refused", ignoreCase = true) ->
+                    "Conexión rechazada por el dispositivo Bluetooth remoto."
+                else ->
+                    "Fallo al enlazar Bluetooth: ${e.message}"
+            }
+            _lastError.value = userFriendlyMsg
             _connectionState.value = ConnectionState.ERROR
             cleanUp()
-            Result.failure(e)
+            Result.failure(Exception(userFriendlyMsg, e))
         }
     }
 
@@ -139,14 +190,36 @@ class BluetoothRfcommTransport(
         try {
             val reader = BufferedReader(InputStreamReader(socket.inputStream, StandardCharsets.UTF_8))
             while (isActive && socket.isConnected) {
-                val line = reader.readLine() ?: break
+                val line = try {
+                    reader.readLine()
+                } catch (e: IOException) {
+                    val msg = e.message ?: ""
+                    if (msg.contains("read ret: -1") || msg.contains("socket might closed") || msg.contains("closed") || msg.contains("broken pipe")) {
+                        // EOF / socket remoto cerrado ordenadamente
+                        null
+                    } else {
+                        throw e
+                    }
+                }
+
+                if (line == null) {
+                    // EOF alcanzado: desconexión ordenada del socket remoto
+                    break
+                }
+
                 if (line.length <= ProtocolConstants.MAX_MESSAGE_SIZE) {
                     _incomingMessages.emit(line)
+                } else {
+                    _lastError.value = "Mensaje Bluetooth descartado: excedió el límite de ${ProtocolConstants.MAX_MESSAGE_SIZE} bytes"
                 }
             }
         } catch (e: Exception) {
             if (!intentionalDisconnect) {
-                _lastError.value = "Pérdida de enlace RFCOMM: ${e.message}"
+                val msg = e.message ?: ""
+                val isNormalDisconnect = msg.contains("read ret: -1") || msg.contains("socket might closed") || msg.contains("closed")
+                if (!isNormalDisconnect) {
+                    _lastError.value = "Pérdida de enlace Bluetooth: ${e.message}"
+                }
             }
         } finally {
             if (!intentionalDisconnect) {
@@ -171,7 +244,7 @@ class BluetoothRfcommTransport(
             w.flush()
             Result.success(Unit)
         } catch (e: Exception) {
-            _lastError.value = "Error enviando vía Bluetooth: ${e.message}"
+            _lastError.value = "Error transmitiendo por Bluetooth: ${e.message}"
             disconnect()
             Result.failure(e)
         }
@@ -181,6 +254,8 @@ class BluetoothRfcommTransport(
         intentionalDisconnect = true
         readerJob?.cancel()
         readerJob = null
+        serverAcceptJob?.cancel()
+        serverAcceptJob = null
         cleanUp()
         _connectionState.value = ConnectionState.DISCONNECTED
     }
@@ -190,5 +265,7 @@ class BluetoothRfcommTransport(
         writer = null
         try { activeSocket?.close() } catch (_: Exception) {}
         activeSocket = null
+        try { serverSocket?.close() } catch (_: Exception) {}
+        serverSocket = null
     }
 }

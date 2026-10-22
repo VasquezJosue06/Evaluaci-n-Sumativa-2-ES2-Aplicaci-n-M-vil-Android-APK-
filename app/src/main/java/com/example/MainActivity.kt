@@ -1,10 +1,15 @@
 package com.example
 
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.WindowInsets
@@ -32,7 +37,9 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
+import androidx.core.content.ContextCompat
 import com.example.ui.AlarmViewModel
 import com.example.ui.screens.AuthScreen
 import com.example.ui.screens.DashboardScreen
@@ -60,9 +67,23 @@ class MainActivity : ComponentActivity() {
 
 @Composable
 fun MainAppContent(viewModel: AlarmViewModel) {
+    val context = LocalContext.current
     val isAuthenticated by viewModel.isAuthenticated.collectAsState()
     val snackbarHostState = remember { SnackbarHostState() }
     var selectedScreenIndex by remember { mutableIntStateOf(0) }
+
+    // Solicitar permiso de notificaciones para Android 13+ (API 33+)
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { _ -> }
+
+    LaunchedEffect(Unit) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            }
+        }
+    }
 
     LaunchedEffect(viewModel) {
         viewModel.userFeedback.collect { message ->
